@@ -1,0 +1,58 @@
+name: SEO Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libxml2 libxml2-dev libxslt1-dev libffi-dev libssl-dev build-essential git
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run VirtuNova SEO Audit
+        env:
+          PAGESPEED_KEY: ${{ secrets.PAGESPEED_KEY }}
+        run: |
+          mkdir -p reports/$(date +'%Y-%m-%d')
+          echo "Running SEO audit for https://www.ellocentlabs.com ..."
+          python seo_audit_tool_extended.py             --url https://www.ellocentlabs.com             --output reports/$(date +'%Y-%m-%d')/report.json             --pages 100             --pagespeed-key "${PAGESPEED_KEY}"             --web-ui
+          echo "Audit finished."
+
+      - name: Upload SEO Reports (JSON + PDF)
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-report
+          path: |
+            reports/**/report.json
+            reports/**/SEO_Audit_Report.pdf
+
+      - name: Commit and Push Reports
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "VirtuNova Bot"
+          git config --global user.email "bot@virtunova.com"
+          git add reports/
+          git commit -m "📊 SEO Audit Report - $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
