@@ -1,5 +1,9 @@
 name: SEO Audit
 
+permissions:
+  contents: write
+
+
 # allow manual run + scheduled weekly run
 on:
   workflow_dispatch:
