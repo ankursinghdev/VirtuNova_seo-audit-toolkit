@@ -1,18 +1,13 @@
 name: SEO Audit
 
+# permissions for pushing files
 permissions:
   contents: write
 
-
-# allow manual run + scheduled weekly run
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * 1'
-
-# ensure the workflow has rights to write content
-permissions:
-  contents: write
 
 jobs:
   audit:
@@ -46,24 +41,26 @@ jobs:
         env:
           PAGESPEED_KEY: ${{ secrets.PAGESPEED_KEY }}
         run: |
-          # create dated folder for artifacts (keeps history)
           DIR="reports/$(date +'%Y-%m-%d')"
           mkdir -p "${DIR}"
+
           echo "Running SEO audit for https://www.ellocentlabs.com ..."
+
           python seo_audit_tool_extended.py \
             --url https://www.ellocentlabs.com \
             --output "${DIR}/report.json" \
             --pages 50 \
             --pagespeed-key "$PAGESPEED_KEY" \
             --web-ui
-          # copy latest into static paths expected by Pages/dashboard
+
+          # copy latest results
           cp "${DIR}/report.json" reports/report.json || true
           cp "${DIR}/SEO_Audit_Report.pdf" reports/SEO_Audit_Report.pdf || true
-          # copy web_ui copy too so dashboard can read it
+
           mkdir -p web_ui
           cp "${DIR}/report.json" web_ui/report.json || true
 
-      - name: Upload SEO reports (JSON + PDF) as artifact
+      - name: Upload SEO report artifacts
         uses: actions/upload-artifact@v4
         with:
           name: seo-report
@@ -71,18 +68,17 @@ jobs:
             reports/**/report.json
             reports/**/SEO_Audit_Report.pdf
 
-      - name: Commit reports to main (so Pages serves them)
+      - name: Commit updated reports to GitHub Pages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "VirtuNova Bot"
           git config user.email "bot@virtunova.com"
-          # stage changed report files
-          git add reports/ web_ui/report.json || true
-          # only commit if there are changes
+
+          git add reports/ web_ui/report.json
+
           if ! git diff --cached --quiet; then
-            git commit -m "chore: add SEO audit report $(date +'%Y-%m-%d')"
-            # push using the token that actions provides
+            git commit -m "chore: SEO report update $(date +'%Y-%m-%d')"
             git push origin HEAD:main
           else
             echo "No changes to commit."
