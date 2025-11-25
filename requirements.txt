@@ -1,7 +1,7 @@
+playwright
 aiohttp
 beautifulsoup4
 lxml
 validators
 reportlab
 requests
-playwright
