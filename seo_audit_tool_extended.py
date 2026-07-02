@@ -24,43 +24,36 @@ Notes:
 """
 import argparse
 import asyncio
-import csv
 import hashlib
 import hmac
 import json
 import os
 import re
 import time
-import math
 from collections import deque
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
-# Optional libs loaded at runtime
-try:
-    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-except Exception:
-    async_playwright = None
-    PWTimeout = Exception
-
-try:
-    import aiohttp
-except Exception:
-    aiohttp = None
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-    from reportlab.lib import colors
-    from reportlab.lib.units import inch
-except Exception:
-    SimpleDocTemplate = None
+from seo_toolkit.imports import (
+    async_playwright,
+    PWTimeout,
+    aiohttp,
+    BeautifulSoup,
+    SimpleDocTemplate,
+    A4,
+    ParagraphStyle,
+    getSampleStyleSheet,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+    colors,
+    inch,
+)
+from seo_toolkit.file_utils import ensure_parent_dir, write_json, write_csv_report
+from seo_toolkit.html_utils import extract_meta_content, extract_link_href
+from seo_toolkit.scoring import compute_page_score
 
 # ---------- Config ----------
 USER_AGENT = "VirtuNova-SEO-Toolkit/1.0 (+https://virtunova.com)"
@@ -99,7 +92,6 @@ async def render_page_content(url, timeout=PLAYWRIGHT_TIMEOUT_MS):
                     await browser.close()
                     return {"url": url, "status": None, "error": f"navigation-timeout: {e}"}
             status = resp.status if resp else None
-            # allow dynamic content settle
             try:
                 await page.wait_for_timeout(500)
             except Exception:
@@ -127,27 +119,20 @@ def analyze_html_from_text(url, html):
         return {}
     soup = BeautifulSoup(html, "lxml")
     result = {}
-    # title & meta
+    # title
     title_tag = soup.find("title")
     title = title_tag.string.strip() if title_tag and title_tag.string else ""
     result["title"] = {"text": title, "length": len(title)}
-    desc_tag = soup.find("meta", attrs={"name": re.compile("description", re.I)})
-    desc = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
+    # meta tags via shared utility
+    desc = extract_meta_content(soup, "description")
     result["meta_description"] = {"text": desc, "length": len(desc)}
+    result["meta_robots"] = extract_meta_content(soup, "robots")
+    result["viewport"] = extract_meta_content(soup, "viewport")
     # headings
     h1s = [h.get_text(strip=True) for h in soup.find_all("h1")]
     result["h1"] = {"count": len(h1s), "texts": h1s}
-    # canonical
-    can_tag = soup.find("link", rel=re.compile("canonical", re.I))
-    canonical = can_tag["href"].strip() if can_tag and can_tag.get("href") else ""
-    result["canonical"] = canonical
-    # robots, viewport
-    robots_tag = soup.find("meta", attrs={"name": re.compile("robots", re.I)})
-    robots = robots_tag["content"].strip() if robots_tag and robots_tag.get("content") else ""
-    result["meta_robots"] = robots
-    viewport_tag = soup.find("meta", attrs={"name": re.compile("viewport", re.I)})
-    viewport = viewport_tag["content"].strip() if viewport_tag and viewport_tag.get("content") else ""
-    result["viewport"] = viewport
+    # canonical via shared utility
+    result["canonical"] = extract_link_href(soup, "canonical")
     # json-ld
     json_ld = []
     for s in soup.find_all("script", type="application/ld+json"):
@@ -179,7 +164,6 @@ def analyze_html_from_text(url, html):
         if hreflang and href:
             hreflangs.append({"hreflang": hreflang, "href": href})
     result["hreflangs"] = hreflangs
-    # detect canonical chain? left to separate function
     return result
 
 def validate_json_ld(json_ld_blocks):
@@ -226,24 +210,16 @@ async def pagespeed_insights(url, api_key, strategy="mobile"):
 
 # ---------- Moz (Off-page metrics) ----------
 def create_moz_auth(access_id, secret):
-    # returns (url, headers) ready for GET to Moz API v2 (linkscape has been deprecated)
-    # We will use Moz's "url-metrics" style signature if you have access.
-    # NOTE: if you do not have Moz keys, this function will not be used.
     expires = int(time.time()) + 300
     string_to_sign = f"{access_id}\n{expires}"
     h = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1)
     signature = h.digest()
-    signature_b64 = signature.hex()  # different encodings used by older examples; confirm with Moz docs
+    signature_b64 = signature.hex()
     return expires, signature_b64
 
 def fetch_moz_metrics(url, access_id, secret):
-    # Placeholder implementation. Moz's modern API uses OAuth or their new endpoints.
-    # If you have MOZ access_id & secret, you can implement exact call per Moz docs.
-    # Here we return Nones if keys not provided.
     if not access_id or not secret:
         return {"domain_authority": None, "page_authority": None, "external_links": None, "moz_rank": None}
-    # In practice implement per docs: https://moz.com/help/links-api
-    # We'll return stub telling user to fill in their API access implementation.
     return {"domain_authority": None, "page_authority": None, "external_links": None, "note": "provide MOZ keys and implement fetch_moz_metrics"}
 
 # ---------- Crawler (Playwright-based) ----------
@@ -269,7 +245,6 @@ class PlaywrightCrawler:
                     if page_result.get("status") and page_result.get("content"):
                         analysis = analyze_html_from_text(url, page_result["content"])
                         self.results[url]["analysis"] = analysis
-                        # extract links and enqueue same-origin pages
                         try:
                             soup = BeautifulSoup(page_result["content"], "lxml")
                             for a in soup.find_all("a", href=True):
@@ -282,74 +257,12 @@ class PlaywrightCrawler:
         tasks = [asyncio.create_task(worker()) for _ in range(3)]
         await asyncio.gather(*tasks)
 
-# ---------- Scoring ----------
-def score_page(analysis, fetch_info):
-    score = 100
-    reasons = []
-    tlen = analysis.get("title", {}).get("length", 0)
-    if tlen == 0:
-        score -= 20; reasons.append("Missing title")
-    if analysis.get("meta_description", {}).get("length", 0) == 0:
-        score -= 10; reasons.append("Missing meta description")
-    if analysis.get("h1", {}).get("count", 0) == 0:
-        score -= 10; reasons.append("Missing H1")
-    if analysis.get("word_count", 0) < 100:
-        score -= 5; reasons.append("Low word count (<100)")
-    status = fetch_info.get("status")
-    if status is None or (status and status >= 400):
-        score = 0; reasons.append(f"HTTP error: {status}")
-    return {"score": max(0, score), "reasons": reasons}
-
-# ---------- CSV export ----------
-def write_csv_report(report, csv_path):
-    # Flatten key metrics per page into CSV rows
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    headers = [
-        "url", "http_status", "title", "title_length", "meta_description", "meta_description_length",
-        "h1_count", "word_count", "images_total", "images_missing_alt", "links_count",
-        "canonical", "hreflang_count", "json_ld_blocks", "score", "score_reasons",
-        "pagespeed_performance", "moz_domain_authority", "moz_page_authority", "moz_external_links"
-    ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=headers)
-        writer.writeheader()
-        pages = report.get("pages", {})
-        for url, p in pages.items():
-            fetch = p.get("fetch", {})
-            analysis = p.get("analysis", {}) or {}
-            scores = p.get("scores", {}) or {}
-            pagespeed = (report.get("pagespeed") or {}).get(url) or {}
-            moz = p.get("offpage", {}) or {}
-            row = {
-                "url": url,
-                "http_status": fetch.get("status"),
-                "title": analysis.get("title", {}).get("text", ""),
-                "title_length": analysis.get("title", {}).get("length", 0),
-                "meta_description": analysis.get("meta_description", {}).get("text", ""),
-                "meta_description_length": analysis.get("meta_description", {}).get("length", 0),
-                "h1_count": analysis.get("h1", {}).get("count", 0),
-                "word_count": analysis.get("word_count", 0),
-                "images_total": analysis.get("images", {}).get("total", 0),
-                "images_missing_alt": analysis.get("images", {}).get("missing_alt_count", 0),
-                "links_count": analysis.get("links", {}).get("count", 0),
-                "canonical": analysis.get("canonical", ""),
-                "hreflang_count": len(analysis.get("hreflangs", [])),
-                "json_ld_blocks": len(analysis.get("json_ld", [])),
-                "score": scores.get("score"),
-                "score_reasons": "; ".join(scores.get("reasons", [])),
-                "pagespeed_performance": pagespeed.get("lighthouseResult", {}).get("categories", {}).get("performance", {}).get("score") if isinstance(pagespeed, dict) else None,
-                "moz_domain_authority": moz.get("domain_authority"),
-                "moz_page_authority": moz.get("page_authority"),
-                "moz_external_links": moz.get("external_links")
-            }
-            writer.writerow(row)
-
 # ---------- PDF report ----------
 def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf"):
     if SimpleDocTemplate is None:
         print("PDF generation skipped — reportlab not installed.")
         return
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    ensure_parent_dir(output_path)
     doc = SimpleDocTemplate(output_path, pagesize=A4)
     styles = getSampleStyleSheet()
     primary = colors.HexColor("#A020F0")
@@ -378,7 +291,6 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
     avg = round(sum(scores)/max(1,len(scores)),1) if scores else 0
     elems.append(Paragraph(f"Average SEO Score: <b>{avg}%</b>", normal))
     elems.append(Spacer(1, 0.15*inch))
-    # Top issues
     issues = [[url, ", ".join(p.get("scores", {}).get("reasons", []))] for url,p in pages.items() if p.get("scores", {}).get("reasons")]
     if not issues:
         issues = [["No major issues found", ""]]
@@ -390,7 +302,6 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
     ]))
     elems.append(table)
     elems.append(Spacer(1, 0.25*inch))
-    # Add sample of off-page metrics (if available)
     offpage_summary = []
     for url,p in pages.items():
         if p.get("offpage") and (p["offpage"].get("domain_authority") or p["offpage"].get("page_authority")):
@@ -404,7 +315,7 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
     elems.append(Paragraph("<font color='#A020F0'><b>VirtuNova — Where Creativity, Technology, and Strategy Converge.</b></font>", styles['Italic']))
     try:
         doc.build(elems)
-        print(f"✅ PDF generated: {output_path}")
+        print(f"PDF generated: {output_path}")
     except Exception as e:
         print(f"PDF generation error: {e}")
 
@@ -418,8 +329,7 @@ async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None
     for url, data in crawler.results.items():
         page = {"fetch": data.get("fetch"), "analysis": data.get("analysis")}
         if page.get("analysis"):
-            page["scores"] = score_page(page["analysis"], page.get("fetch", {}))
-        # off-page metrics per page if keys provided
+            page["scores"] = compute_page_score(page["analysis"], page.get("fetch", {}))
         if moz_access_id and moz_secret:
             page["offpage"] = fetch_moz_metrics(url, moz_access_id, moz_secret)
         report["pages"][url] = page
@@ -434,22 +344,17 @@ async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None
             report["pagespeed"] = {p: r for p, r in zip(candidates, results)}
         except Exception as e:
             report["pagespeed_error"] = str(e)
-    # write output JSON
+    # write outputs using shared file utilities
     if output_path:
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-    # write CSV
-    csv_path = os.path.join(os.path.dirname(output_path) or ".", "report.csv")
-    write_csv_report(report, csv_path)
-    # write web_ui
+        write_json(report, output_path)
+        csv_path = os.path.join(os.path.dirname(output_path) or ".", "report.csv")
+        write_csv_report(report, csv_path)
     if write_web_ui:
-        os.makedirs("web_ui", exist_ok=True)
-        with open(os.path.join("web_ui", "report.json"), "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        write_json(report, os.path.join("web_ui", "report.json"))
     # generate PDF (summary)
-    pdf_out = os.path.join(os.path.dirname(output_path) or ".", "SEO_Audit_Report.pdf")
-    generate_pdf_report(report, output_path=pdf_out)
+    if output_path:
+        pdf_out = os.path.join(os.path.dirname(output_path) or ".", "SEO_Audit_Report.pdf")
+        generate_pdf_report(report, output_path=pdf_out)
     return report
 
 def cli():
