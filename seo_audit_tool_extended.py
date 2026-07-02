@@ -131,44 +131,44 @@ def same_origin(a, b):
     return (pa.scheme, pa.netloc) == (pb.scheme, pb.netloc)
 
 # ---------- Playwright renderer ----------
-async def render_page_content(url, timeout=PLAYWRIGHT_TIMEOUT_MS):
-    if not async_playwright:
+async def render_page_content(browser, url, timeout=PLAYWRIGHT_TIMEOUT_MS):
+    if not browser:
         return {"url": url, "status": None, "error": "playwright-not-installed"}
+    page = None
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"], headless=True)
-            page = await browser.new_page(user_agent=USER_AGENT)
+        page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            resp = await page.goto(url, timeout=timeout, wait_until="networkidle")
+        except PWTimeout:
             try:
-                resp = await page.goto(url, timeout=timeout, wait_until="networkidle")
-            except PWTimeout:
-                try:
-                    resp = await page.goto(url, timeout=timeout, wait_until="load")
-                except Exception as e:
-                    await browser.close()
-                    return {"url": url, "status": None, "error": f"navigation-timeout: {e}"}
-            status = resp.status if resp else None
-            try:
-                await page.wait_for_timeout(500)
-            except Exception:
-                logger.debug("Timeout waiting for content settle on %s", url)
-            content = await page.content()
+                resp = await page.goto(url, timeout=timeout, wait_until="load")
+            except Exception as e:
+                return {"url": url, "status": None, "error": f"navigation-timeout: {e}"}
+        status = resp.status if resp else None
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            logger.debug("Timeout waiting for content settle on %s", url)
+        content = await page.content()
+        title = ""
+        try:
+            title = await page.title()
+        except Exception as e:
+            logger.warning("Failed to retrieve page title for %s: %s", url, e)
             title = ""
-            try:
-                title = await page.title()
-            except Exception as e:
-                logger.warning("Failed to retrieve page title for %s: %s", url, e)
-                title = ""
+        headers = {}
+        try:
+            if resp:
+                headers = dict(await resp.all_headers())
+        except Exception as e:
+            logger.warning("Failed to retrieve response headers for %s: %s", url, e)
             headers = {}
-            try:
-                if resp:
-                    headers = dict(await resp.all_headers())
-            except Exception as e:
-                logger.warning("Failed to retrieve response headers for %s: %s", url, e)
-                headers = {}
-            await browser.close()
-            return {"url": url, "status": status, "content": content, "title": title, "headers": filter_headers(headers)}
+        return {"url": url, "status": status, "content": content, "title": title, "headers": filter_headers(headers)}
     except Exception as e:
         return {"url": url, "status": None, "error": str(e)}
+    finally:
+        if page:
+            await page.close()
 
 # ---------- HTML analysis ----------
 def analyze_html_from_text(url, html):
@@ -178,7 +178,7 @@ def analyze_html_from_text(url, html):
     result = {}
     # title
     title_tag = soup.find("title")
-    title = title_tag.string.strip() if title_tag and title_tag.string else ""
+    title = title_tag.get_text(strip=True) if title_tag else ""
     result["title"] = {"text": title, "length": len(title)}
     # meta tags via shared utility
     desc = extract_meta_content(soup, "description")
@@ -307,30 +307,62 @@ class PlaywrightCrawler:
     async def run(self):
         if not async_playwright:
             raise RuntimeError("Playwright is required. Install 'playwright' and run 'playwright install chromium'.")
-        sem = asyncio.Semaphore(3)
-        async def worker():
-            while self.to_visit and len(self.results) < self.max_pages:
-                url = self.to_visit.popleft()
-                async with sem:
-                    page_result = await render_page_content(url)
-                    self.results[url] = {"fetch": page_result}
-                    if page_result.get("status") and page_result.get("content"):
-                        analysis = analyze_html_from_text(url, page_result["content"])
-                        self.results[url]["analysis"] = analysis
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"], headless=True)
+            queue = asyncio.Queue()
+            queue.put_nowait(self.seed)
+            active_workers = 0
+            done_event = asyncio.Event()
+
+            async def worker():
+                nonlocal active_workers
+                while True:
+                    try:
+                        url = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        if active_workers == 0:
+                            break
+                        # Wait briefly for other workers to enqueue new URLs
+                        done_event.clear()
                         try:
-                            soup = BeautifulSoup(page_result["content"], "lxml")
-                            for a in soup.find_all("a", href=True):
-                                n = normalize_url(url, a["href"])
-                                if not n: continue
-                                parsed_n = urlparse(n)
-                                if parsed_n.scheme not in ALLOWED_SCHEMES:
-                                    continue
-                                if parsed_n.netloc == self.seed_netloc and n not in self.seen and len(self.seen) < self.max_pages:
-                                    self.seen.add(n); self.to_visit.append(n)
-                        except Exception as e:
-                            logger.warning("Link extraction failed for %s: %s", url, e)
-        tasks = [asyncio.create_task(worker()) for _ in range(3)]
-        await asyncio.gather(*tasks)
+                            await asyncio.wait_for(done_event.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            pass
+                        if queue.empty() and active_workers == 0:
+                            break
+                        continue
+
+                    if len(self.results) >= self.max_pages:
+                        break
+
+                    active_workers += 1
+                    try:
+                        page_result = await render_page_content(browser, url)
+                        self.results[url] = {"fetch": page_result}
+                        if page_result.get("status") and page_result.get("content"):
+                            analysis = analyze_html_from_text(url, page_result["content"])
+                            self.results[url]["analysis"] = analysis
+                            try:
+                                soup = BeautifulSoup(page_result["content"], "lxml")
+                                for a in soup.find_all("a", href=True):
+                                    n = normalize_url(url, a["href"])
+                                    if not n:
+                                        continue
+                                    parsed_n = urlparse(n)
+                                    if parsed_n.scheme not in ALLOWED_SCHEMES:
+                                        continue
+                                    if parsed_n.netloc == self.seed_netloc and n not in self.seen and len(self.seen) < self.max_pages:
+                                        self.seen.add(n)
+                                        queue.put_nowait(n)
+                            except Exception as e:
+                                logger.warning("Link extraction failed for %s: %s", url, e)
+                    finally:
+                        active_workers -= 1
+                        done_event.set()
+
+            tasks = [asyncio.create_task(worker()) for _ in range(3)]
+            await asyncio.gather(*tasks)
+            await browser.close()
 
 # ---------- PDF report ----------
 def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf"):
@@ -416,7 +448,7 @@ async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None
     report["json_ld_issues"] = {u: validate_json_ld(p["analysis"].get("json_ld", [])) for u,p in report["pages"].items() if p.get("analysis")}
     # pagespeed insights (site + first 3 pages)
     if pagespeed_key:
-        candidates = [seed_url] + list(report["pages"].keys())[:3]
+        candidates = list(dict.fromkeys([seed_url] + list(report["pages"].keys())[:3]))
         psi_tasks = [pagespeed_insights(p, pagespeed_key, strategy="mobile") for p in candidates]
         results = await asyncio.gather(*psi_tasks, return_exceptions=True)
         report["pagespeed"] = {}

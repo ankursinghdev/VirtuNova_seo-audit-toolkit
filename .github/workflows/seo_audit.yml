@@ -75,7 +75,8 @@ jobs:
           git config user.name "VirtuNova Bot"
           git config user.email "bot@virtunova.com"
 
-          git add reports/ web_ui/report.json
+          git add reports/
+          [ -f web_ui/report.json ] && git add web_ui/report.json || true
 
           if ! git diff --cached --quiet; then
             git commit -m "chore: SEO report update $(date +'%Y-%m-%d')"
