@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -35,6 +36,8 @@ import time
 from collections import deque
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
+
+logger = logging.getLogger(__name__)
 
 from seo_toolkit.imports import (
     async_playwright,
@@ -147,18 +150,20 @@ async def render_page_content(url, timeout=PLAYWRIGHT_TIMEOUT_MS):
             try:
                 await page.wait_for_timeout(500)
             except Exception:
-                pass
+                logger.debug("Timeout waiting for content settle on %s", url)
             content = await page.content()
             title = ""
             try:
                 title = await page.title()
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to retrieve page title for %s: %s", url, e)
                 title = ""
             headers = {}
             try:
                 if resp:
                     headers = dict(await resp.all_headers())
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to retrieve response headers for %s: %s", url, e)
                 headers = {}
             await browser.close()
             return {"url": url, "status": status, "content": content, "title": title, "headers": filter_headers(headers)}
@@ -191,8 +196,9 @@ def analyze_html_from_text(url, html):
         if s.string:
             try:
                 json_ld.append(json.loads(s.string))
-            except Exception:
-                json_ld.append({"raw": s.string[:500]})
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning("Malformed JSON-LD block on %s: %s", url, e)
+                json_ld.append({"raw": s.string[:500], "parse_error": str(e)})
     result["json_ld"] = json_ld
     # images
     imgs = soup.find_all("img")
@@ -253,12 +259,26 @@ async def pagespeed_insights(url, api_key, strategy="mobile"):
         return {"error": "aiohttp-not-installed"}
     api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {"url": url, "key": api_key, "strategy": strategy}
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
-            async with session.get(api, params=params, timeout=30) as resp:
-                return await resp.json()
-        except Exception as e:
-            return {"error": str(e)}
+            async with session.get(api, params=params) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    logger.warning(
+                        "PageSpeed API returned HTTP %d for %s: %s",
+                        resp.status, url, data.get("error", {}).get("message", "unknown error"),
+                    )
+                return data
+        except aiohttp.ClientError as e:
+            logger.error("PageSpeed network error for %s: %s", url, e)
+            return {"error": f"{type(e).__name__}: {e}"}
+        except asyncio.TimeoutError:
+            logger.error("PageSpeed request timed out for %s", url)
+            return {"error": "Request timed out"}
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("PageSpeed returned non-JSON response for %s: %s", url, e)
+            return {"error": f"{type(e).__name__}: {e}"}
 
 # ---------- Moz (Off-page metrics) ----------
 def create_moz_auth(access_id, secret):
@@ -307,8 +327,8 @@ class PlaywrightCrawler:
                                     continue
                                 if parsed_n.netloc == self.seed_netloc and n not in self.seen and len(self.seen) < self.max_pages:
                                     self.seen.add(n); self.to_visit.append(n)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("Link extraction failed for %s: %s", url, e)
         tasks = [asyncio.create_task(worker()) for _ in range(3)]
         await asyncio.gather(*tasks)
 
@@ -331,8 +351,8 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
         try:
             elems.append(Image(logo_path, width=1.6*inch, height=1.6*inch))
             elems.append(Spacer(1, 0.15*inch))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to embed logo in PDF: %s", e)
     elems.append(Paragraph("VirtuNova — Full SEO Audit Report", title_style))
     elems.append(Spacer(1, 0.1*inch))
     elems.append(Paragraph(f"<b>Website:</b> {report_data.get('site','')}", normal))
@@ -370,9 +390,10 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
     elems.append(Paragraph("<font color='#A020F0'><b>VirtuNova — Where Creativity, Technology, and Strategy Converge.</b></font>", styles['Italic']))
     try:
         doc.build(elems)
-        print(f"PDF generated: {output_path}")
+        logger.info("PDF generated: %s", output_path)
     except Exception as e:
-        print(f"PDF generation error: {e}")
+        logger.error("PDF generation failed for %s: %s", output_path, e)
+        raise
 
 # ---------- Main runner ----------
 async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None, moz_access_id=None, moz_secret=None, write_web_ui=False):
@@ -396,23 +417,29 @@ async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None
     # pagespeed insights (site + first 3 pages)
     if pagespeed_key:
         candidates = [seed_url] + list(report["pages"].keys())[:3]
-        tasks = [pagespeed_insights(p, pagespeed_key, strategy="mobile") for p in candidates]
-        try:
-            results = await asyncio.gather(*tasks)
-            report["pagespeed"] = {p: r for p, r in zip(candidates, results)}
-        except Exception as e:
-            report["pagespeed_error"] = str(e)
+        psi_tasks = [pagespeed_insights(p, pagespeed_key, strategy="mobile") for p in candidates]
+        results = await asyncio.gather(*psi_tasks, return_exceptions=True)
+        report["pagespeed"] = {}
+        for candidate_url, result in zip(candidates, results):
+            if isinstance(result, Exception):
+                logger.error("PageSpeed Insights failed for %s: %s", candidate_url, result)
+                report["pagespeed"][candidate_url] = {"error": f"{type(result).__name__}: {result}"}
+            else:
+                report["pagespeed"][candidate_url] = result
     # write outputs using shared file utilities
     if output_path:
         write_json(report, output_path)
-        csv_path = os.path.join(os.path.dirname(output_path) or ".", "report.csv")
+        out_dir = os.path.dirname(output_path) or "."
+        csv_path = os.path.join(out_dir, "report.csv")
         write_csv_report(report, csv_path)
+        # generate PDF (summary) alongside JSON
+        pdf_out = os.path.join(out_dir, "SEO_Audit_Report.pdf")
+        try:
+            generate_pdf_report(report, output_path=pdf_out)
+        except Exception:
+            pass  # already logged inside generate_pdf_report
     if write_web_ui:
         write_json(report, os.path.join("web_ui", "report.json"))
-    # generate PDF (summary)
-    if output_path:
-        pdf_out = os.path.join(os.path.dirname(output_path) or ".", "SEO_Audit_Report.pdf")
-        generate_pdf_report(report, output_path=pdf_out)
     return report
 
 def cli():
