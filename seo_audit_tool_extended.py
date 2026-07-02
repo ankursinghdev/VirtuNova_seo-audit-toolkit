@@ -97,7 +97,7 @@ async def render_page_content(url, timeout=PLAYWRIGHT_TIMEOUT_MS):
             status = resp.status if resp else None
             try:
                 await page.wait_for_timeout(500)
-            except PWTimeout:
+            except Exception:
                 logger.debug("Timeout waiting for content settle on %s", url)
             content = await page.content()
             title = ""
@@ -373,7 +373,10 @@ async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None
         write_csv_report(report, csv_path)
         # generate PDF (summary) alongside JSON
         pdf_out = os.path.join(out_dir, "SEO_Audit_Report.pdf")
-        generate_pdf_report(report, output_path=pdf_out)
+        try:
+            generate_pdf_report(report, output_path=pdf_out)
+        except Exception:
+            pass  # already logged inside generate_pdf_report
     if write_web_ui:
         write_json(report, os.path.join("web_ui", "report.json"))
     return report
