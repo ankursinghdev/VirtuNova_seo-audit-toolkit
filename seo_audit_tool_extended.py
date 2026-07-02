@@ -224,6 +224,9 @@ async def pagespeed_insights(url, api_key, strategy="mobile"):
         except asyncio.TimeoutError:
             logger.error("PageSpeed request timed out for %s", url)
             return {"error": "Request timed out"}
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("PageSpeed returned non-JSON response for %s: %s", url, e)
+            return {"error": f"{type(e).__name__}: {e}"}
 
 # ---------- Moz (Off-page metrics) ----------
 def create_moz_auth(access_id, secret):

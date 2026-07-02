@@ -9,7 +9,7 @@ try/except blocks.
 def _try_import(import_fn):
     try:
         return import_fn()
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         return None
 
 
