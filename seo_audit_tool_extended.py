@@ -26,9 +26,11 @@ import argparse
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from collections import deque
 from datetime import datetime
@@ -60,6 +62,56 @@ USER_AGENT = "VirtuNova-SEO-Toolkit/1.0 (+https://virtunova.com)"
 DEFAULT_MAX_PAGES = 100
 REQUEST_TIMEOUT = 30
 PLAYWRIGHT_TIMEOUT_MS = 30000
+ALLOWED_SCHEMES = {"http", "https"}
+SENSITIVE_HEADERS = {
+    "set-cookie", "authorization", "proxy-authorization",
+    "cookie", "x-api-key", "x-csrf-token", "x-xsrf-token",
+}
+
+# ---------- Security helpers ----------
+def validate_url(url):
+    """Reject non-HTTP(S) schemes and private/internal IP targets."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        raise ValueError(
+            f"Blocked URL scheme '{parsed.scheme}' — only http/https allowed"
+        )
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no hostname")
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+        for _family, _type, _proto, _canonname, sockaddr in resolved:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise ValueError(
+                    f"Blocked request to private/internal address {ip} "
+                    f"(resolved from {hostname})"
+                )
+    except socket.gaierror:
+        pass  # let the actual request fail with a proper network error
+    return url
+
+
+def sanitize_output_path(path):
+    """Ensure the output path stays under the current working directory."""
+    resolved = os.path.realpath(path)
+    cwd = os.path.realpath(os.getcwd())
+    if not resolved.startswith(cwd + os.sep) and resolved != cwd:
+        raise ValueError(
+            f"Output path '{path}' resolves outside the working directory"
+        )
+    return resolved
+
+
+def filter_headers(headers):
+    """Strip sensitive headers before persisting to reports."""
+    if not headers:
+        return {}
+    return {
+        k: v for k, v in headers.items()
+        if k.lower() not in SENSITIVE_HEADERS
+    }
 
 # ---------- Helpers ----------
 def normalize_url(base, href):
@@ -109,7 +161,7 @@ async def render_page_content(url, timeout=PLAYWRIGHT_TIMEOUT_MS):
             except Exception:
                 headers = {}
             await browser.close()
-            return {"url": url, "status": status, "content": content, "title": title, "headers": headers}
+            return {"url": url, "status": status, "content": content, "title": title, "headers": filter_headers(headers)}
     except Exception as e:
         return {"url": url, "status": None, "error": str(e)}
 
@@ -212,7 +264,7 @@ async def pagespeed_insights(url, api_key, strategy="mobile"):
 def create_moz_auth(access_id, secret):
     expires = int(time.time()) + 300
     string_to_sign = f"{access_id}\n{expires}"
-    h = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1)
+    h = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256)
     signature = h.digest()
     signature_b64 = signature.hex()
     return expires, signature_b64
@@ -250,7 +302,10 @@ class PlaywrightCrawler:
                             for a in soup.find_all("a", href=True):
                                 n = normalize_url(url, a["href"])
                                 if not n: continue
-                                if urlparse(n).netloc == self.seed_netloc and n not in self.seen and len(self.seen) < self.max_pages:
+                                parsed_n = urlparse(n)
+                                if parsed_n.scheme not in ALLOWED_SCHEMES:
+                                    continue
+                                if parsed_n.netloc == self.seed_netloc and n not in self.seen and len(self.seen) < self.max_pages:
                                     self.seen.add(n); self.to_visit.append(n)
                         except Exception:
                             pass
@@ -323,6 +378,9 @@ def generate_pdf_report(report_data, output_path="reports/SEO_Audit_Report.pdf")
 async def run_audit(seed_url, output_path=None, max_pages=50, pagespeed_key=None, moz_access_id=None, moz_secret=None, write_web_ui=False):
     if not seed_url:
         raise ValueError("Please provide a URL")
+    validate_url(seed_url)
+    if output_path:
+        sanitize_output_path(output_path)
     crawler = PlaywrightCrawler(seed_url, max_pages=max_pages)
     await crawler.run()
     report = {"site": seed_url, "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "pages": {}}
@@ -367,6 +425,15 @@ def cli():
     parser.add_argument("--moz-secret", default=None)
     parser.add_argument("--web-ui", action="store_true")
     args = parser.parse_args()
+    try:
+        validate_url(args.url)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.output:
+        try:
+            sanitize_output_path(args.output)
+        except ValueError as e:
+            parser.error(str(e))
     report = asyncio.run(run_audit(args.url, output_path=args.output, max_pages=args.pages, pagespeed_key=args.pagespeed_key, moz_access_id=args.moz_access_id, moz_secret=args.moz_secret, write_web_ui=args.web_ui))
     print("Audit complete. Output:", args.output)
 
