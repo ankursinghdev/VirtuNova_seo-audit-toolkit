@@ -25,6 +25,7 @@ class TestPagespeedInsights:
     @pytest.mark.asyncio
     async def test_successful_api_call(self):
         mock_response = AsyncMock()
+        mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"lighthouseResult": {"score": 90}})
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=False)
@@ -43,13 +44,17 @@ class TestPagespeedInsights:
 
     @pytest.mark.asyncio
     async def test_api_call_exception(self):
+        import aiohttp as real_aiohttp
+
         mock_session = AsyncMock()
-        mock_session.get = MagicMock(side_effect=Exception("connection failed"))
+        mock_session.get = MagicMock(side_effect=real_aiohttp.ClientError("connection failed"))
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         mock_aiohttp = MagicMock()
         mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+        mock_aiohttp.ClientError = real_aiohttp.ClientError
+        mock_aiohttp.ClientTimeout = real_aiohttp.ClientTimeout
 
         with patch("seo_audit_tool_extended.aiohttp", mock_aiohttp):
             result = await pagespeed_insights("https://example.com", "key123")

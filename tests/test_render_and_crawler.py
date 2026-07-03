@@ -8,11 +8,10 @@ from seo_audit_tool_extended import render_page_content, PlaywrightCrawler
 
 class TestRenderPageContent:
     @pytest.mark.asyncio
-    async def test_returns_error_when_playwright_missing(self):
-        with patch("seo_audit_tool_extended.async_playwright", None):
-            result = await render_page_content("https://example.com")
-            assert result["error"] == "playwright-not-installed"
-            assert result["status"] is None
+    async def test_returns_error_when_browser_is_none(self):
+        result = await render_page_content(None, "https://example.com")
+        assert result["error"] == "playwright-not-installed"
+        assert result["status"] is None
 
     @pytest.mark.asyncio
     async def test_returns_content_on_success(self):
@@ -25,37 +24,41 @@ class TestRenderPageContent:
         mock_page.content = AsyncMock(return_value="<html><body>Hello</body></html>")
         mock_page.title = AsyncMock(return_value="Test Title")
         mock_page.wait_for_timeout = AsyncMock()
+        mock_page.close = AsyncMock()
 
         mock_browser = AsyncMock()
         mock_browser.new_page = AsyncMock(return_value=mock_page)
-        mock_browser.close = AsyncMock()
 
-        mock_pw_instance = AsyncMock()
-        mock_pw_instance.chromium.launch = AsyncMock(return_value=mock_browser)
-
-        mock_pw_cm = AsyncMock()
-        mock_pw_cm.__aenter__ = AsyncMock(return_value=mock_pw_instance)
-        mock_pw_cm.__aexit__ = AsyncMock(return_value=False)
-
-        mock_pw = MagicMock(return_value=mock_pw_cm)
-
-        with patch("seo_audit_tool_extended.async_playwright", mock_pw):
-            result = await render_page_content("https://example.com")
-            assert result["status"] == 200
-            assert "Hello" in result["content"]
-            assert result["title"] == "Test Title"
+        result = await render_page_content(mock_browser, "https://example.com")
+        assert result["status"] == 200
+        assert "Hello" in result["content"]
+        assert result["title"] == "Test Title"
+        mock_page.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_handles_exception(self):
-        mock_pw_cm = AsyncMock()
-        mock_pw_cm.__aenter__ = AsyncMock(side_effect=Exception("launch failed"))
-        mock_pw_cm.__aexit__ = AsyncMock(return_value=False)
-        mock_pw = MagicMock(return_value=mock_pw_cm)
+        mock_browser = AsyncMock()
+        mock_browser.new_page = AsyncMock(side_effect=Exception("launch failed"))
 
-        with patch("seo_audit_tool_extended.async_playwright", mock_pw):
-            result = await render_page_content("https://example.com")
-            assert "error" in result
-            assert "launch failed" in result["error"]
+        result = await render_page_content(mock_browser, "https://example.com")
+        assert "error" in result
+        assert "launch failed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_page_closed_on_mid_operation_failure(self):
+        mock_page = AsyncMock()
+        mock_page.goto = AsyncMock(return_value=AsyncMock(status=200))
+        mock_page.wait_for_timeout = AsyncMock()
+        mock_page.content = AsyncMock(side_effect=Exception("content extraction failed"))
+        mock_page.close = AsyncMock()
+
+        mock_browser = AsyncMock()
+        mock_browser.new_page = AsyncMock(return_value=mock_page)
+
+        result = await render_page_content(mock_browser, "https://example.com")
+        assert "error" in result
+        assert "content extraction failed" in result["error"]
+        mock_page.close.assert_awaited_once()
 
 
 class TestPlaywrightCrawler:

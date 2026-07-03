@@ -30,14 +30,34 @@ DEFAULT_RULES = [
         reason="Missing title",
     ),
     ScoreRule(
+        check=lambda a, f: a.get("title", {}).get("length", 0) > 60,
+        penalty=5,
+        reason="Title too long (recommended <=60 chars)",
+    ),
+    ScoreRule(
         check=lambda a, f: a.get("meta_description", {}).get("length", 0) == 0,
         penalty=10,
         reason="Missing meta description",
     ),
     ScoreRule(
+        check=lambda a, f: a.get("meta_description", {}).get("length", 0) > 160,
+        penalty=5,
+        reason="Meta description too long (recommended <=160 chars)",
+    ),
+    ScoreRule(
         check=lambda a, f: a.get("h1", {}).get("count", 0) == 0,
         penalty=10,
         reason="Missing H1",
+    ),
+    ScoreRule(
+        check=lambda a, f: a.get("h1", {}).get("count", 0) > 1,
+        penalty=5,
+        reason="Multiple H1 tags (recommended 1)",
+    ),
+    ScoreRule(
+        check=lambda a, f: not a.get("canonical"),
+        penalty=5,
+        reason="Missing canonical tag",
     ),
     ScoreRule(
         check=lambda a, f: a.get("word_count", 0) < 100,
